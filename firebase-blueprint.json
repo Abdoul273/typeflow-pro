@@ -1,0 +1,76 @@
+{
+  "entities": {
+    "User": {
+      "title": "User",
+      "description": "User profile information",
+      "type": "object",
+      "properties": {
+        "uid": { "type": "string", "description": "Auth UID" },
+        "email": { "type": "string", "description": "User email" },
+        "displayName": { "type": "string", "description": "User display name" },
+        "photoURL": { "type": "string", "description": "User avatar URL" },
+        "createdAt": { "type": "string", "format": "date-time", "description": "Profile creation date" },
+        "lastLogin": { "type": "string", "format": "date-time", "description": "Last login timestamp" },
+        "xp": { "type": "number", "description": "Experience points gained by typing" },
+        "badges": { "type": "array", "description": "List of unlocked badge identifiers" },
+        "bestWpm": { "type": "number", "description": "Personal best WPM" },
+        "averageAccuracy": { "type": "number", "description": "Average typing accuracy" },
+        "totalSessions": { "type": "number", "description": "Total completed exercises" },
+        "completedExercises": { "type": "object", "description": "Map of completed exercises with best scores and stars" },
+        "currentExerciseId": { "type": "string", "description": "Currently active exercise ID" },
+        "starsCount": { "type": "number", "description": "Total stars earned" },
+        "streak": { "type": "number", "description": "Consecutive days streak" },
+        "lastStreakDate": { "type": "string", "description": "Date of last streak increment" }
+      },
+      "required": ["uid"]
+    },
+    "TypingSession": {
+      "title": "TypingSession",
+      "description": "Information about a completed typing session",
+      "type": "object",
+      "properties": {
+        "userId": { "type": "string", "description": "Reference to User UID" },
+        "wpm": { "type": "number", "description": "Words per minute" },
+        "accuracy": { "type": "number", "description": "Accuracy percentage" },
+        "errors": { "type": "number", "description": "Number of errors" },
+        "exerciseTitle": { "type": "string", "description": "Title of the exercise" },
+        "userName": { "type": "string", "description": "Display name of the user" },
+        "userPhoto": { "type": "string", "description": "Avatar URL of the user" },
+        "date": { "type": "string", "format": "date-time", "description": "Session completion date" }
+      },
+      "required": ["userId", "wpm", "accuracy", "date"]
+    },
+    "DuelRoom": {
+      "title": "DuelRoom",
+      "description": "Real-time 1v1 typing race room between two users",
+      "type": "object",
+      "properties": {
+        "id": { "type": "string", "description": "Duel ID" },
+        "code": { "type": "string", "description": "Short 6-character room code" },
+        "textTitle": { "type": "string", "description": "Title of the duel text" },
+        "textContent": { "type": "string", "description": "Exact text content for both racers" },
+        "category": { "type": "string", "description": "Duel text category or difficulty" },
+        "status": { "type": "string", "enum": ["waiting", "ready", "starting", "in_progress", "finished"] },
+        "createdAt": { "type": "string", "format": "date-time" },
+        "player1": { "type": "object", "description": "Creator player state" },
+        "player2": { "type": "object", "description": "Opponent player state" },
+        "winnerId": { "type": "string", "description": "Winner UID or ID" }
+      },
+      "required": ["code", "textTitle", "textContent", "status", "player1"]
+    }
+  },
+  "firestore": {
+    "/users/{uid}": {
+      "schema": "User",
+      "description": "Users collection"
+    },
+    "/sessions/{sessionId}": {
+      "schema": "TypingSession",
+      "description": "Sessions collection"
+    },
+    "/duels/{duelId}": {
+      "schema": "DuelRoom",
+      "description": "Real-time 1v1 multi-user typing duels collection"
+    }
+  }
+}

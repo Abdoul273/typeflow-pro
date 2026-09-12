@@ -1,0 +1,110 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // ===============================================================
+    // Assumed Data Model
+    // ===============================================================
+    //
+    // Collection: users
+    // Document ID: {uid}
+    // Fields:
+    //   - uid: string (required) - Auth UID
+    //   - email: string (optional) - User email
+    //   - displayName: string (optional) - User display name
+    //   - photoURL: string (optional) - User avatar URL
+    //   - createdAt: string (optional) - ISO 8601 date
+    //   - lastLogin: string (optional) - ISO 8601 date
+    //   - xp: number (optional) - Experience points
+    //
+    // Collection: sessions
+    // Document ID: {sessionId}
+    // Fields:
+    //   - userId: string (required) - User UID
+    //   - wpm: number (required) - Words per minute
+    //   - accuracy: number (required) - Accuracy percentage
+    //   - errors: number (optional) - Total errors
+    //   - exerciseTitle: string (optional) - Title of the exercise
+    //   - userName: string (optional) - User display name
+    //   - userPhoto: string (optional) - User avatar URL
+    //   - date: string (required) - ISO 8601 date
+    //
+    // ===============================================================
+
+    // Helper Functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isValidEmail(email) {
+      return email is string && email.matches("^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\\.[a-zA-Z]{2,}$");
+    }
+
+    function isValidDate(dateStr) {
+      return dateStr is string && dateStr.matches("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}.*Z?$");
+    }
+
+    // Domain Validators
+    function isValidUser(data) {
+      return data.uid == request.auth.uid &&
+             (!('email' in data) || (data.email is string && isValidEmail(data.email))) &&
+             (!('displayName' in data) || data.displayName == null || (data.displayName is string && data.displayName.size() < 100)) &&
+             (!('photoURL' in data) || data.photoURL == null || (data.photoURL is string && data.photoURL.size() < 500)) &&
+             (!('createdAt' in data) || isValidDate(data.createdAt)) &&
+             (!('lastLogin' in data) || isValidDate(data.lastLogin)) &&
+             (!('xp' in data) || (data.xp is number && data.xp >= 0)) &&
+             (!('badges' in data) || (data.badges is list && data.badges.size() <= 50)) &&
+             (!('bestWpm' in data) || (data.bestWpm is number && data.bestWpm >= 0 && data.bestWpm < 500)) &&
+             (!('averageAccuracy' in data) || (data.averageAccuracy is number && data.averageAccuracy >= 0 && data.averageAccuracy <= 100)) &&
+             (!('totalSessions' in data) || (data.totalSessions is number && data.totalSessions >= 0)) &&
+             (!('completedExercises' in data) || data.completedExercises is map) &&
+             (!('currentExerciseId' in data) || (data.currentExerciseId is string && data.currentExerciseId.size() < 100)) &&
+             (!('starsCount' in data) || (data.starsCount is number && data.starsCount >= 0)) &&
+             (!('streak' in data) || (data.streak is number && data.streak >= 0)) &&
+             (!('longestStreak' in data) || (data.longestStreak is number && data.longestStreak >= 0)) &&
+             (!('dailyActivity' in data) || data.dailyActivity is map) &&
+             (!('lastStreakDate' in data) || (data.lastStreakDate is string && data.lastStreakDate.size() < 50));
+    }
+
+    function isValidSession(data) {
+      return data.userId == request.auth.uid &&
+             data.wpm is number && data.wpm >= 0 && data.wpm < 500 &&
+             data.accuracy is number && data.accuracy >= 0 && data.accuracy <= 100 &&
+             isValidDate(data.date) &&
+             (!('errors' in data) || (data.errors is number && data.errors >= 0)) &&
+             (!('exerciseTitle' in data) || (data.exerciseTitle is string && data.exerciseTitle.size() < 100)) &&
+             (!('userName' in data) || data.userName == null || (data.userName is string && data.userName.size() < 100)) &&
+             (!('userPhoto' in data) || data.userPhoto == null || (data.userPhoto is string && data.userPhoto.size() < 500));
+    }
+
+    // Connection check
+    match /test/connection {
+      allow read: if true;
+    }
+
+    // Users collection
+    match /users/{uid} {
+      allow read: if isOwner(uid);
+      allow create, update: if isOwner(uid) && isValidUser(request.resource.data);
+    }
+
+    // Sessions collection - public leaderboard allows all users to read
+    match /sessions/{sessionId} {
+      allow read: if true;
+      allow create: if isAuthenticated() && isValidSession(request.resource.data);
+      allow update, delete: if isAuthenticated() && resource.data.userId == request.auth.uid && isValidSession(request.resource.data);
+    }
+
+    // Duels collection for real-time 1v1 multi-user typing competitions
+    match /duels/{duelId} {
+      allow read: if true;
+      allow create: if true;
+      allow update: if true;
+      allow delete: if isAuthenticated();
+    }
+  }
+}
+

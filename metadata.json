@@ -1,0 +1,6 @@
+{
+  "name": "TypeFlow Pro",
+  "description": "An intelligent, adaptive typing trainer with AI-powered exercises, real-time 1v1 multi-user duels, streak analytics, and gamified progress.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
