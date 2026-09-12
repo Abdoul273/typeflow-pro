@@ -1,5 +1,3 @@
-import { GoogleGenAI, Type } from "@google/genai";
-
 export interface AIAssessment {
   suggestedText: string;
   feedback: string;
@@ -12,35 +10,6 @@ const FALLBACK_ASSESSMENT: AIAssessment = {
   focusCharacters: []
 };
 
-function resolveApiKey(): string {
-  const viteEnv = (import.meta as ImportMeta & { env?: Record<string, string | undefined> }).env;
-  const raw =
-    process.env.GEMINI_API_KEY ||
-    viteEnv?.VITE_GEMINI_API_KEY ||
-    viteEnv?.GEMINI_API_KEY ||
-    "";
-  const key = String(raw).trim();
-  if (!key || key === "undefined" || key === "MY_GEMINI_API_KEY") {
-    return "";
-  }
-  return key;
-}
-
-let aiClient: GoogleGenAI | null = null;
-
-function getAiClient(): GoogleGenAI | null {
-  if (aiClient) return aiClient;
-  const apiKey = resolveApiKey();
-  if (!apiKey) return null;
-  try {
-    aiClient = new GoogleGenAI({ apiKey });
-    return aiClient;
-  } catch (error) {
-    console.warn("Gemini client unavailable:", error);
-    return null;
-  }
-}
-
 export const analyzePerformance = async (history: any[]): Promise<AIAssessment> => {
   if (history.length === 0) {
     return {
@@ -50,40 +19,31 @@ export const analyzePerformance = async (history: any[]): Promise<AIAssessment> 
     };
   }
 
-  const ai = getAiClient();
-  if (!ai) {
-    return FALLBACK_ASSESSMENT;
-  }
-
-  const prompt = `L'utilisateur a terminé plusieurs sessions de frappe. Voici son historique récent :
-  ${JSON.stringify(history.slice(0, 5))}
-  
-  En tant que coach de frappe expert, analyse ces données et :
-  1. Identifie les caractères ou combinaisons de touches problématiques.
-  2. Fournis un court texte d'entraînement (environ 15-20 mots) qui cible ces faiblesses.
-  3. Donne un conseil motivant.`;
-
   try {
-    const response = await ai.models.generateContent({
-      model: "gemini-3-flash-preview",
-      contents: prompt,
-      config: {
-        responseMimeType: "application/json",
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            suggestedText: { type: Type.STRING, description: "Le texte d'entraînement ciblé" },
-            feedback: { type: Type.STRING, description: "Conseil personnalisé" },
-            focusCharacters: { type: Type.ARRAY, items: { type: Type.STRING }, description: "Liste des caractères à travailler" }
-          },
-          required: ["suggestedText", "feedback", "focusCharacters"]
-        }
-      }
+    const res = await fetch('/api/analyze-performance', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ history }),
     });
 
-    return JSON.parse(response.text);
+    if (!res.ok) {
+      throw new Error(`Server returned HTTP ${res.status}`);
+    }
+
+    const data = await res.json();
+    if (data && data.suggestedText && data.feedback) {
+      return {
+        suggestedText: data.suggestedText,
+        feedback: data.feedback,
+        focusCharacters: Array.isArray(data.focusCharacters) ? data.focusCharacters : []
+      };
+    }
+
+    return FALLBACK_ASSESSMENT;
   } catch (error) {
-    console.error("Gemini Analysis Error:", error);
+    console.warn("Gemini Analysis API Error:", error);
     return FALLBACK_ASSESSMENT;
   }
 };
