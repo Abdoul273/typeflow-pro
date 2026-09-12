@@ -1,14 +1,15 @@
 import React from 'react';
 import { motion } from 'motion/react';
-import { Brain, Sparkles, ArrowRight } from 'lucide-react';
+import { Brain, Sparkles, ArrowRight, X } from 'lucide-react';
 import { AIAssessment } from '../services/geminiService';
 
 interface AICoachProps {
   assessment: AIAssessment | null;
   onApplyExercise: (text: string) => void;
+  onClose?: () => void;
 }
 
-export const AICoach: React.FC<AICoachProps> = ({ assessment, onApplyExercise }) => {
+export const AICoach: React.FC<AICoachProps> = ({ assessment, onApplyExercise, onClose }) => {
   if (!assessment) return null;
 
   return (
@@ -17,9 +18,19 @@ export const AICoach: React.FC<AICoachProps> = ({ assessment, onApplyExercise })
       animate={{ opacity: 1, scale: 1 }}
       className="bg-gradient-to-br from-blue-900/20 to-purple-900/20 border border-blue-500/30 p-6 rounded-3xl backdrop-blur-md relative overflow-hidden group shadow-2xl"
     >
-      <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity">
+      <div className="absolute top-0 right-0 p-4 opacity-10 group-hover:opacity-20 transition-opacity pointer-events-none">
         <Sparkles size={120} className="text-blue-400" />
       </div>
+
+      {onClose && (
+        <button
+          onClick={onClose}
+          className="absolute top-4 right-4 p-1.5 rounded-full text-slate-400 hover:text-white bg-white/5 hover:bg-white/10 transition-colors z-20 cursor-pointer"
+          title="Fermer les recommandations du coach"
+        >
+          <X size={18} />
+        </button>
+      )}
 
       <div className="flex items-start gap-4 relative z-10">
         <div className="bg-blue-600 p-3 rounded-2xl shadow-lg shadow-blue-500/20">

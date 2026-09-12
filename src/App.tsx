@@ -329,6 +329,7 @@ function App() {
         title: currentExercise.title,
         date: new Date().toISOString(),
       };
+      userSessionsCompletedRef.current += 1;
       setHistory(prev => [newRecord, ...prev]);
 
       // Check if this is a new personal WPM record
@@ -544,24 +545,28 @@ function App() {
     return () => unsubscribe();
   }, []);
 
-  // Trigger AI assessment automatically after 3 sessions
-  useEffect(() => {
-    if (history.length > 0 && history.length % 3 === 0) {
-      handleAnalyze();
-    }
-  }, [history.length]);
+  // Track actual user sessions completed in current app lifetime
+  const userSessionsCompletedRef = React.useRef(0);
 
-  const handleAnalyze = async () => {
+  const handleAnalyze = useCallback(async () => {
+    if (isAnalyzing) return;
     setIsAnalyzing(true);
     try {
-      const result = await analyzePerformance(history);
+      const result = await analyzePerformance(history, errorHistory, keyboardLayout);
       setAIAssessment(result);
     } catch (error) {
-      console.error(error);
+      console.warn('AI assessment note:', error);
     } finally {
       setIsAnalyzing(false);
     }
-  };
+  }, [isAnalyzing, history, errorHistory, keyboardLayout]);
+
+  // Trigger AI assessment automatically after 3 real completed sessions by the user
+  useEffect(() => {
+    if (userSessionsCompletedRef.current > 0 && userSessionsCompletedRef.current % 3 === 0) {
+      handleAnalyze();
+    }
+  }, [history.length, handleAnalyze]);
 
   const handleSelectLayout = (newLayout: KeyboardLayoutType) => {
     setKeyboardLayout(newLayout);
@@ -994,14 +999,29 @@ function App() {
             className="flex-1 flex flex-col gap-8"
           >
             <div className="bg-slate-900/50 border border-white/5 rounded-[2.5rem] p-8 sm:p-12 backdrop-blur-xl">
-              <div className="flex items-center gap-4 mb-10">
-                <div className="bg-blue-500/20 p-4 rounded-2xl">
-                  <TrendingUp className="text-blue-500" size={32} />
+              <div className="flex items-center justify-between flex-wrap gap-4 mb-10">
+                <div className="flex items-center gap-4">
+                  <div className="bg-blue-500/20 p-4 rounded-2xl">
+                    <TrendingUp className="text-blue-500" size={32} />
+                  </div>
+                  <div>
+                    <h2 className="text-4xl font-black text-white italic tracking-tighter uppercase">Analyses <span className="text-blue-500 italic">Détaillées</span></h2>
+                    <p className="text-slate-500 font-medium">Évolution de vos performances au fil du temps</p>
+                  </div>
                 </div>
-                <div>
-                  <h2 className="text-4xl font-black text-white italic tracking-tighter uppercase">Analyses <span className="text-blue-500 italic">Détaillées</span></h2>
-                  <p className="text-slate-500 font-medium">Évolution de vos performances au fil du temps</p>
-                </div>
+
+                <button
+                  onClick={() => {
+                    handleAnalyze();
+                    setTab('practice');
+                  }}
+                  disabled={isAnalyzing}
+                  className="flex items-center gap-2 px-4 py-2.5 rounded-2xl bg-gradient-to-r from-purple-600 to-indigo-600 hover:from-purple-500 hover:to-indigo-500 text-white font-bold text-xs shadow-lg shadow-purple-500/20 transition-all cursor-pointer disabled:opacity-50"
+                  title="Obtenir un diagnostic personnalisé et lancer un exercice ciblé"
+                >
+                  <Brain size={16} className={isAnalyzing ? "animate-pulse" : ""} />
+                  <span>{isAnalyzing ? "Analyse en cours..." : "Consulter le Coach IA"}</span>
+                </button>
               </div>
 
               {history.length < 2 ? (
@@ -1228,7 +1248,11 @@ function App() {
               exit={{ height: 0, opacity: 0, marginTop: 0 }}
               className="overflow-hidden"
             >
-              <AICoach assessment={aiAssessment} onApplyExercise={applyAIExercise} />
+              <AICoach 
+                assessment={aiAssessment} 
+                onApplyExercise={applyAIExercise} 
+                onClose={() => setAIAssessment(null)}
+              />
             </motion.div>
           )}
         </AnimatePresence>
@@ -1382,6 +1406,24 @@ function App() {
               <span>{countdownTimeLimit > 0 ? `Défi: ${countdownTimeLimit}s` : 'Chrono Libre'}</span>
               {countdownTimeLimit > 0 && (
                 <span className="w-2 h-2 rounded-full bg-amber-400 animate-pulse" />
+              )}
+            </button>
+
+            <button
+              onClick={handleAnalyze}
+              disabled={isAnalyzing}
+              className={cn(
+                "flex items-center gap-2 px-3.5 py-2.5 rounded-xl border text-xs font-bold transition-all cursor-pointer shadow-sm hover:scale-105 active:scale-95 disabled:opacity-50",
+                aiAssessment
+                  ? "bg-purple-600/20 hover:bg-purple-600/30 border-purple-500/40 text-purple-300"
+                  : "bg-slate-900 hover:bg-slate-800 border-white/10 text-slate-200"
+              )}
+              title="Recevoir une analyse et un exercice ciblé par le Coach IA"
+            >
+              <Brain size={14} className={isAnalyzing ? "animate-pulse text-purple-400" : "text-purple-400"} />
+              <span>{isAnalyzing ? "Analyse..." : "Coach IA"}</span>
+              {aiAssessment && (
+                <span className="w-1.5 h-1.5 rounded-full bg-purple-400 animate-pulse" />
               )}
             </button>
 
