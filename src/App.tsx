@@ -888,6 +888,8 @@ function App() {
         "flex-1 w-full mx-auto flex flex-col relative z-10 transition-all duration-300",
         isFocusModeActive 
           ? "max-w-5xl justify-center items-center px-4 py-4 sm:py-8 min-h-[calc(100vh-2rem)]" 
+          : tab === 'duel'
+          ? "max-w-7xl p-5 sm:p-8 gap-8"
           : "max-w-5xl p-6 sm:p-12 gap-10"
       )}>
         {tab === 'duel' ? (

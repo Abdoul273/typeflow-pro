@@ -22,10 +22,12 @@ import {
   Flag,
   Gauge,
   Target,
-  Shield,
-  Activity,
   Columns2,
-  Maximize2
+  Maximize2,
+  Hourglass,
+  Medal,
+  Hash,
+  Keyboard
 } from 'lucide-react';
 import { 
   DuelRoom, 
@@ -41,9 +43,16 @@ import {
   setPlayerReadyStatus, 
   startDuelCountdown, 
   launchDuelRace, 
-  finishDuelRoom, 
+  reportPlayerFinished, 
   rematchDuelRoom,
-  leaveDuelRoom
+  requestRematch,
+  tryStartRematch,
+  finalizeDuelIfDeadlinePassed,
+  leaveDuelRoom,
+  computeRaceStats,
+  getStableGuestId,
+  textFingerprint,
+  RACE_SYNC_MS
 } from '../lib/duel';
 import { copyToClipboard } from '../lib/clipboard';
 import { DuelShareModal } from './DuelShareModal';
@@ -116,15 +125,19 @@ export const DuelView: React.FC<DuelViewProps> = ({
   // Current user representation in duel
   const currentPlayer = useMemo<DuelPlayer>(() => {
     return {
-      id: user?.uid || `guest_${Math.random().toString(36).substring(2, 9)}`,
+      id: user?.uid || getStableGuestId(),
       name: userProfile?.displayName || user?.displayName || 'Pilote Rapide',
       photo: user?.photoURL || null,
       ready: false,
+      rematchReady: false,
       progress: 0,
       cursorIndex: 0,
       wpm: 0,
+      rawWpm: 0,
       accuracy: 100,
       errors: 0,
+      correctChars: 0,
+      totalKeystrokes: 0,
       finished: false,
       finishTime: null
     };
@@ -156,6 +169,15 @@ export const DuelView: React.FC<DuelViewProps> = ({
 
   // Dual Screen View Mode: 'split' (side-by-side) or 'single' (focused)
   const [duelViewMode, setDuelViewMode] = useState<'split' | 'single'>('split');
+  const [localFinished, setLocalFinished] = useState(false);
+  const [localFinishStats, setLocalFinishStats] = useState<{
+    wpm: number;
+    rawWpm: number;
+    accuracy: number;
+    finishTime: number;
+    errors: number;
+  } | null>(null);
+  const [smoothOppCursor, setSmoothOppCursor] = useState(0);
 
   // Group text into whole words with attached spaces and sentence boundary detection
   const wordTokens = useMemo(() => {
@@ -173,6 +195,14 @@ export const DuelView: React.FC<DuelViewProps> = ({
   const raceTimerRef = useRef<NodeJS.Timeout | null>(null);
   const hiddenInputRef = useRef<HTMLInputElement | null>(null);
   const lastSyncRef = useRef<number>(0);
+  const localStartMsRef = useRef<number | null>(null);
+  const awardedRoundRef = useRef<number | null>(null);
+  const userInputRef = useRef('');
+  const inputErrorsRef = useRef(0);
+  const localFinishedRef = useRef(false);
+  const smoothOppRef = useRef(0);
+  const oppCursorRef = useRef(0);
+  const joinLockRef = useRef(false);
 
   // Determine current user's role in the duel: 'player1' or 'player2'
   const playerRole = useMemo<'player1' | 'player2' | null>(() => {
@@ -185,6 +215,14 @@ export const DuelView: React.FC<DuelViewProps> = ({
   const isPlayer1 = playerRole === 'player1';
   const myPlayer = duelRoom ? (isPlayer1 ? duelRoom.player1 : duelRoom.player2) : null;
   const opponentPlayer = duelRoom ? (isPlayer1 ? duelRoom.player2 : duelRoom.player1) : null;
+  const sharedText = duelRoom?.textContent || '';
+  const sharedFingerprint = duelRoom?.textFingerprint || (sharedText ? textFingerprint(sharedText) : '');
+  const currentRound = duelRoom?.round || 1;
+
+  userInputRef.current = userInput;
+  inputErrorsRef.current = inputErrors;
+  localFinishedRef.current = localFinished;
+  oppCursorRef.current = opponentPlayer?.cursorIndex || 0;
 
   // Subscribe to public open duels when on lobby
   useEffect(() => {
@@ -197,9 +235,8 @@ export const DuelView: React.FC<DuelViewProps> = ({
     }
   }, [activeDuelId, currentPlayer.id]);
 
-  // Auto-fill and auto-join if an initial duel code was provided via URL query (?duel=CODE)
   useEffect(() => {
-    if (initialDuelCode && !activeDuelId) {
+    if (initialDuelCode && !activeDuelId && !joinLockRef.current) {
       setJoinCodeInput(initialDuelCode);
       handleJoinDuel(initialDuelCode);
     }
@@ -279,17 +316,15 @@ export const DuelView: React.FC<DuelViewProps> = ({
           playCountdownTick(1);
         }
       } else if (remainingMs > -800) {
-        // Step 0: "PARTEZ !"
         setSyncedCountdown(0);
         if (lastChimedCountdownRef.current !== 0) {
           lastChimedCountdownRef.current = 0;
+          localStartMsRef.current = Math.max(Date.now(), targetEpoch);
           playChallengeSuccessSound();
           setTimeout(() => {
             hiddenInputRef.current?.focus();
           }, 20);
-
-          // Atomic Firestore transition by host (or either client if delay)
-          if (isPlayer1 && activeDuelId) {
+          if (activeDuelId) {
             launchDuelRace(activeDuelId, targetEpoch);
           }
         }
@@ -299,7 +334,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
         if (countdownIntervalRef.current) {
           clearInterval(countdownIntervalRef.current);
         }
-        if (isPlayer1 && activeDuelId && duelRoom.status === 'starting') {
+        if (activeDuelId && duelRoom.status === 'starting') {
           launchDuelRace(activeDuelId, targetEpoch);
         }
       }
@@ -313,29 +348,45 @@ export const DuelView: React.FC<DuelViewProps> = ({
     };
   }, [duelRoom?.status, duelRoom?.raceStartsAt, isPlayer1, activeDuelId]);
 
-  // Initialize race typing when status transitions to 'in_progress' or countdown starts
   useEffect(() => {
     if (duelRoom?.status === 'in_progress') {
-      const startMs = duelRoom.startTime || duelRoom.raceStartsAt || Date.now();
+      const startMs = localStartMsRef.current || duelRoom.startTime || duelRoom.raceStartsAt || Date.now();
+      if (!localStartMsRef.current) localStartMsRef.current = startMs;
       setRaceStartTime(startMs);
 
-      // Focus hidden input
       setTimeout(() => {
         hiddenInputRef.current?.focus();
-      }, 50);
+      }, 40);
 
-      // Start elapsed timer
       if (raceTimerRef.current) clearInterval(raceTimerRef.current);
       raceTimerRef.current = setInterval(() => {
-        setElapsedSeconds(Math.max(0, Math.floor((Date.now() - startMs) / 1000)));
-      }, 500);
+        const origin = localStartMsRef.current || startMs;
+        setElapsedSeconds(Math.max(0, Math.floor((Date.now() - origin) / 1000)));
+      }, 200);
     } else if (duelRoom?.status === 'starting') {
-      // Clear previous keystrokes on the starting grid
       setUserInput('');
       setInputErrors(0);
       setIsErrorState(false);
       setElapsedSeconds(0);
-      setRaceStartTime(duelRoom.raceStartsAt || Date.now() + 3500);
+      setLocalFinished(false);
+      setLocalFinishStats(null);
+      localFinishedRef.current = false;
+      localStartMsRef.current = duelRoom.raceStartsAt || Date.now() + 3500;
+      setRaceStartTime(localStartMsRef.current);
+      smoothOppRef.current = 0;
+      setSmoothOppCursor(0);
+    } else if (duelRoom?.status === 'ready' || duelRoom?.status === 'waiting') {
+      setUserInput('');
+      setInputErrors(0);
+      setIsErrorState(false);
+      setElapsedSeconds(0);
+      setLocalFinished(false);
+      setLocalFinishStats(null);
+      localFinishedRef.current = false;
+      localStartMsRef.current = null;
+      smoothOppRef.current = 0;
+      setSmoothOppCursor(0);
+      if (raceTimerRef.current) clearInterval(raceTimerRef.current);
     } else {
       if (raceTimerRef.current) clearInterval(raceTimerRef.current);
     }
@@ -343,129 +394,177 @@ export const DuelView: React.FC<DuelViewProps> = ({
     return () => {
       if (raceTimerRef.current) clearInterval(raceTimerRef.current);
     };
-  }, [duelRoom?.status, duelRoom?.startTime, duelRoom?.raceStartsAt]);
+  }, [duelRoom?.status, duelRoom?.startTime, duelRoom?.raceStartsAt, duelRoom?.round, duelRoom?.textId]);
 
-  // Simulated Bot competitor progress loop with fluid, human-like keystroke cadence
   useEffect(() => {
-    if (!duelRoom || !duelRoom.isBot || duelRoom.status !== 'in_progress' || !activeDuelId) {
+    if (!duelRoom || !duelRoom.isBot || duelRoom.status !== 'in_progress' || !activeDuelId || !isPlayer1) {
       if (botIntervalRef.current) clearInterval(botIntervalRef.current);
       return;
     }
 
     const textLen = duelRoom.textContent.length;
     const targetWpm = duelRoom.botTargetWpm || 60;
-    // Average 5 chars per word -> chars per second = (targetWpm * 5) / 60
     const charsPerSec = (targetWpm * 5) / 60;
-    const tickIntervalMs = 70;
-    const charsPerTick = (charsPerSec * (tickIntervalMs / 1000));
-
-    let botCursor = duelRoom.player2?.cursorIndex || 0;
-    let botErrors = duelRoom.player2?.errors || 0;
-    let pauseRemainingMs = 0;
-    const startMs = Date.now();
-    let lastReportedCursor = botCursor;
+    const startMs = duelRoom.startTime || duelRoom.raceStartsAt || Date.now();
+    let lastReportedCursor = -1;
+    let botFinished = Boolean(duelRoom.player2?.finished);
 
     botIntervalRef.current = setInterval(() => {
-      if (pauseRemainingMs > 0) {
-        pauseRemainingMs -= tickIntervalMs;
+      if (botFinished) return;
+      const elapsedMs = Math.max(250, Date.now() - startMs);
+      const wave = 1 + Math.sin(elapsedMs / 900) * 0.05;
+      const currentIntCursor = Math.min(textLen, Math.floor((elapsedMs / 1000) * charsPerSec * wave));
+      const botErrors = Math.max(0, Math.floor(currentIntCursor * ((100 - (BOT_PROFILES.find(b => b.difficulty === duelRoom.botDifficulty)?.accuracy || 96)) / 100)));
+      const stats = computeRaceStats({
+        correctChars: currentIntCursor,
+        errors: botErrors,
+        elapsedMs,
+        totalChars: textLen
+      });
+
+      if (currentIntCursor >= textLen) {
+        botFinished = true;
+        if (botIntervalRef.current) clearInterval(botIntervalRef.current);
+        reportPlayerFinished(activeDuelId, 'player2', {
+          cursorIndex: textLen,
+          progress: 100,
+          wpm: stats.wpm,
+          rawWpm: stats.rawWpm,
+          accuracy: stats.accuracy,
+          errors: botErrors,
+          correctChars: textLen,
+          totalKeystrokes: stats.totalKeystrokes,
+          finished: true,
+          finishTime: stats.finishTime
+        });
         return;
       }
 
-      // Add slight human jitter (some ticks faster, micro-pauses on spaces & punctuation)
-      const jitter = (Math.random() - 0.48) * 0.4;
-      const advance = Math.max(0, charsPerTick + jitter);
-      const prevInt = Math.floor(botCursor);
-      botCursor = Math.min(textLen, botCursor + advance);
-      const currentIntCursor = Math.floor(botCursor);
-
-      // If passing a space or sentence boundary, add a small realistic micro-pause
-      if (currentIntCursor > prevInt && currentIntCursor < textLen) {
-        const currentChar = duelRoom.textContent[currentIntCursor];
-        if (currentChar === ' ') {
-          pauseRemainingMs = 90 + Math.random() * 60;
-        } else if (currentChar === '.' || currentChar === '!' || currentChar === '?') {
-          pauseRemainingMs = 140 + Math.random() * 80;
-        }
-      }
-
-      const progress = Math.min(100, Math.round((currentIntCursor / textLen) * 100));
-      const elapsedSec = Math.max(0.5, (Date.now() - startMs) / 1000);
-      const calculatedWpm = elapsedSec > 1 ? Math.round((currentIntCursor / 5) / (elapsedSec / 60)) : targetWpm;
-
-      // Rare random bot error
-      if (Math.random() < 0.015) {
-        botErrors += 1;
-      }
-      const accuracy = Math.max(90, 100 - Math.round((botErrors / Math.max(1, currentIntCursor)) * 100));
-
-      if (currentIntCursor >= textLen) {
-        // Bot finished race!
-        if (botIntervalRef.current) clearInterval(botIntervalRef.current);
+      if (currentIntCursor !== lastReportedCursor) {
+        lastReportedCursor = currentIntCursor;
         updatePlayerRaceProgress(activeDuelId, 'player2', {
-          cursorIndex: textLen,
-          progress: 100,
-          wpm: calculatedWpm,
-          accuracy,
-          finished: true,
-          finishTime: Math.round(elapsedSec * 10) / 10
+          cursorIndex: currentIntCursor,
+          progress: stats.progress,
+          wpm: stats.wpm,
+          rawWpm: stats.rawWpm,
+          accuracy: stats.accuracy,
+          errors: botErrors,
+          correctChars: currentIntCursor,
+          totalKeystrokes: stats.totalKeystrokes,
+          lastHeartbeat: Date.now()
         });
-
-        // If player 1 hasn't won yet, bot is winner
-        if (!duelRoom.winnerId) {
-          finishDuelRoom(activeDuelId, duelRoom.player2!.id, 'player2', {
-            cursorIndex: textLen,
-            progress: 100,
-            wpm: calculatedWpm,
-            accuracy,
-            finished: true,
-            finishTime: Math.round(elapsedSec * 10) / 10
-          });
-        }
-      } else {
-        if (currentIntCursor !== lastReportedCursor) {
-          lastReportedCursor = currentIntCursor;
-          updatePlayerRaceProgress(activeDuelId, 'player2', {
-            cursorIndex: currentIntCursor,
-            progress,
-            wpm: calculatedWpm,
-            accuracy,
-            errors: botErrors
-          });
-        }
       }
-    }, tickIntervalMs);
+    }, 160);
 
     return () => {
       if (botIntervalRef.current) clearInterval(botIntervalRef.current);
     };
-  }, [duelRoom?.status, duelRoom?.isBot, activeDuelId]);
+  }, [duelRoom?.status, duelRoom?.isBot, duelRoom?.botDifficulty, duelRoom?.startTime, duelRoom?.raceStartsAt, activeDuelId, isPlayer1]);
 
-  // Celebrate on Duel Finish
   useEffect(() => {
-    if (duelRoom?.status === 'finished') {
-      if (duelRoom.winnerId === currentPlayer.id) {
-        triggerRecordConfetti();
-        playVictoryFanfare();
-        if (onUpdateXP) {
-          onUpdateXP(80); // Win bonus XP
-        }
-      } else {
-        if (onUpdateXP) {
-          onUpdateXP(30); // Participation bonus XP
-        }
-      }
+    if (duelRoom?.status !== 'finished') return;
+    if (awardedRoundRef.current === currentRound) return;
+    awardedRoundRef.current = currentRound;
+    if (duelRoom.winnerId === currentPlayer.id) {
+      triggerRecordConfetti();
+      playVictoryFanfare();
+      onUpdateXP?.(80);
+    } else {
+      onUpdateXP?.(30);
     }
-  }, [duelRoom?.status, duelRoom?.winnerId, currentPlayer.id]);
+  }, [duelRoom?.status, duelRoom?.winnerId, currentPlayer.id, currentRound, onUpdateXP]);
 
-  // Active race typing status (ready when in_progress or countdown hits 0)
+  useEffect(() => {
+    if (!duelRoom || (duelRoom.status !== 'in_progress' && duelRoom.status !== 'starting')) {
+      smoothOppRef.current = oppCursorRef.current;
+      setSmoothOppCursor(oppCursorRef.current);
+      return;
+    }
+
+    let raf = 0;
+    const tick = () => {
+      const target = oppCursorRef.current;
+      const current = smoothOppRef.current;
+      const next = Math.abs(target - current) < 0.4 ? target : current + (target - current) * 0.32;
+      if (Math.round(next) !== Math.round(current)) {
+        setSmoothOppCursor(Math.round(next));
+      }
+      smoothOppRef.current = next;
+      raf = requestAnimationFrame(tick);
+    };
+    raf = requestAnimationFrame(tick);
+    return () => cancelAnimationFrame(raf);
+  }, [duelRoom?.status]);
+
+  useEffect(() => {
+    if (!activeDuelId || !duelRoom || duelRoom.status !== 'in_progress' || !duelRoom.finishDeadlineAt) return;
+    const remaining = duelRoom.finishDeadlineAt - Date.now();
+    const timeout = setTimeout(() => {
+      finalizeDuelIfDeadlinePassed(activeDuelId);
+    }, Math.max(250, remaining));
+    return () => clearTimeout(timeout);
+  }, [activeDuelId, duelRoom?.status, duelRoom?.finishDeadlineAt]);
+
+  useEffect(() => {
+    if (
+      !activeDuelId ||
+      !duelRoom ||
+      duelRoom.status !== 'finished' ||
+      duelRoom.isBot ||
+      !duelRoom.player1?.rematchReady ||
+      !duelRoom.player2?.rematchReady
+    ) return;
+    tryStartRematch(activeDuelId, duelRoom.category, layout);
+  }, [
+    activeDuelId,
+    duelRoom?.status,
+    duelRoom?.isBot,
+    duelRoom?.player1?.rematchReady,
+    duelRoom?.player2?.rematchReady,
+    duelRoom?.category,
+    layout
+  ]);
+
+  useEffect(() => {
+    if (!activeDuelId || !playerRole || !duelRoom) return;
+    if (duelRoom.status !== 'in_progress' || localFinished) return;
+
+    const beat = setInterval(() => {
+      const typed = userInputRef.current;
+      if (!typed.length) return;
+      const origin = localStartMsRef.current || duelRoom.startTime || duelRoom.raceStartsAt || Date.now();
+      const stats = computeRaceStats({
+        correctChars: typed.length,
+        errors: inputErrorsRef.current,
+        elapsedMs: Date.now() - origin,
+        totalChars: duelRoom.textContent.length
+      });
+      updatePlayerRaceProgress(activeDuelId, playerRole, {
+        cursorIndex: typed.length,
+        progress: stats.progress,
+        wpm: stats.wpm,
+        rawWpm: stats.rawWpm,
+        accuracy: stats.accuracy,
+        errors: inputErrorsRef.current,
+        correctChars: typed.length,
+        totalKeystrokes: stats.totalKeystrokes,
+        lastHeartbeat: Date.now()
+      });
+    }, 400);
+
+    return () => clearInterval(beat);
+  }, [activeDuelId, playerRole, duelRoom?.status, duelRoom?.textContent, localFinished]);
+
   const isRaceActive = Boolean(
-    duelRoom && (
-      duelRoom.status === 'in_progress' || 
+    duelRoom &&
+    !localFinished &&
+    !myPlayer?.finished &&
+    (
+      duelRoom.status === 'in_progress' ||
       (duelRoom.status === 'starting' && syncedCountdown === 0)
     )
   );
 
-  // Handle typing input
   const handleInputChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     if (!duelRoom || !isRaceActive || !playerRole || !activeDuelId) return;
 
@@ -473,7 +572,6 @@ export const DuelView: React.FC<DuelViewProps> = ({
     const targetText = duelRoom.textContent;
 
     if (value.length < userInput.length) {
-      // User pressed backspace
       setUserInput(value);
       setIsErrorState(false);
       return;
@@ -482,58 +580,66 @@ export const DuelView: React.FC<DuelViewProps> = ({
     if (value.length > userInput.length) {
       const expectedChar = targetText[userInput.length];
       const typedChar = value.slice(userInput.length)[0];
-
       if (!typedChar) return;
 
       if (typedChar === expectedChar) {
-        // Correct keystroke
         playKeyClick(typedChar);
         setIsErrorState(false);
         const newInput = targetText.slice(0, userInput.length + 1);
         setUserInput(newInput);
 
-        const currentChars = newInput.length;
-        const progress = Math.min(100, Math.round((currentChars / targetText.length) * 100));
-        const raceStartEpoch = duelRoom.startTime || duelRoom.raceStartsAt || raceStartTime || Date.now();
-        const elapsedSec = Math.max(0.5, (Date.now() - raceStartEpoch) / 1000);
-        const wpm = Math.round((currentChars / 5) / (elapsedSec / 60));
-        const accuracy = Math.max(50, 100 - Math.round((inputErrors / Math.max(1, currentChars + inputErrors)) * 100));
+        const origin = localStartMsRef.current || duelRoom.startTime || duelRoom.raceStartsAt || raceStartTime || Date.now();
+        const stats = computeRaceStats({
+          correctChars: newInput.length,
+          errors: inputErrors,
+          elapsedMs: Date.now() - origin,
+          totalChars: targetText.length
+        });
 
-        // Finished race!
-        if (currentChars >= targetText.length) {
-          const finalTime = Math.round(elapsedSec * 10) / 10;
-          const finalWpm = Math.round((targetText.length / 5) / (elapsedSec / 60));
-          
-          finishDuelRoom(activeDuelId, currentPlayer.id, playerRole, {
+        if (newInput.length >= targetText.length) {
+          localFinishedRef.current = true;
+          setLocalFinished(true);
+          setLocalFinishStats({
+            wpm: stats.wpm,
+            rawWpm: stats.rawWpm,
+            accuracy: stats.accuracy,
+            finishTime: stats.finishTime,
+            errors: inputErrors
+          });
+          reportPlayerFinished(activeDuelId, playerRole, {
             progress: 100,
             cursorIndex: targetText.length,
-            wpm: finalWpm,
-            accuracy,
+            wpm: stats.wpm,
+            rawWpm: stats.rawWpm,
+            accuracy: stats.accuracy,
             errors: inputErrors,
+            correctChars: targetText.length,
+            totalKeystrokes: stats.totalKeystrokes,
             finished: true,
-            finishTime: finalTime
+            finishTime: stats.finishTime
           });
           return;
         }
 
-        // Throttle Firestore write (ultra fast: max once per 70ms or on space or finish)
         const now = Date.now();
-        if (now - lastSyncRef.current > 70 || typedChar === ' ') {
+        if (now - lastSyncRef.current > RACE_SYNC_MS || typedChar === ' ') {
           lastSyncRef.current = now;
           updatePlayerRaceProgress(activeDuelId, playerRole, {
-            cursorIndex: currentChars,
-            progress,
-            wpm,
-            accuracy,
-            errors: inputErrors
+            cursorIndex: newInput.length,
+            progress: stats.progress,
+            wpm: stats.wpm,
+            rawWpm: stats.rawWpm,
+            accuracy: stats.accuracy,
+            errors: inputErrors,
+            correctChars: newInput.length,
+            totalKeystrokes: stats.totalKeystrokes,
+            lastHeartbeat: now
           });
         }
       } else {
-        // Mistake
         playErrorSound(typedChar);
         setIsErrorState(true);
         setInputErrors(prev => prev + 1);
-        // Reset the input field so it doesn't accumulate incorrect keystrokes
         if (hiddenInputRef.current) {
           hiddenInputRef.current.value = userInput;
         }
@@ -567,7 +673,8 @@ export const DuelView: React.FC<DuelViewProps> = ({
 
   // Join duel by code handler
   const handleJoinDuel = async (codeToJoin: string) => {
-    if (!codeToJoin.trim()) return;
+    if (!codeToJoin.trim() || joinLockRef.current) return;
+    joinLockRef.current = true;
     setIsJoining(true);
     setJoinError(null);
     try {
@@ -578,6 +685,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
       });
       setActiveDuelId(roomId);
     } catch (err: any) {
+      joinLockRef.current = false;
       setJoinError(err.message || "Impossible de rejoindre ce duel.");
     } finally {
       setIsJoining(false);
@@ -596,22 +704,28 @@ export const DuelView: React.FC<DuelViewProps> = ({
     }
   };
 
-  // Rematch handler
   const handleRematch = () => {
-    if (!duelRoom || !activeDuelId) return;
-    rematchDuelRoom(activeDuelId, duelRoom.category, layout, Boolean(duelRoom.isBot));
+    if (!duelRoom || !activeDuelId || !playerRole) return;
+    if (duelRoom.isBot) {
+      rematchDuelRoom(activeDuelId, duelRoom.category, layout, true);
+      return;
+    }
+    requestRematch(activeDuelId, playerRole, duelRoom.category, layout, false);
   };
 
-  // Leave room handler
   const handleLeaveRoom = () => {
     if (activeDuelId && playerRole) {
       leaveDuelRoom(activeDuelId, playerRole);
     }
+    joinLockRef.current = false;
     setActiveDuelId(null);
     setDuelRoom(null);
     setUserInput('');
     setInputErrors(0);
+    setLocalFinished(false);
+    setLocalFinishStats(null);
     setSyncedCountdown(null);
+    awardedRoundRef.current = null;
   };
 
   // Copy code to clipboard & open share modal
@@ -629,7 +743,9 @@ export const DuelView: React.FC<DuelViewProps> = ({
   // Calculate lead margin in characters & words
   const leadStats = useMemo(() => {
     if (!myPlayer || !opponentPlayer) return null;
-    const diff = (myPlayer.cursorIndex || 0) - (opponentPlayer.cursorIndex || 0);
+    const myCursor = localFinished ? (sharedText.length || myPlayer.cursorIndex || 0) : userInput.length;
+    const oppCursor = Math.max(opponentPlayer.cursorIndex || 0, smoothOppCursor);
+    const diff = myCursor - oppCursor;
     const wordsDiff = Math.round(Math.abs(diff) / 5);
     return {
       diff,
@@ -637,22 +753,34 @@ export const DuelView: React.FC<DuelViewProps> = ({
       isAhead: diff > 0,
       isTied: diff === 0
     };
-  }, [myPlayer?.cursorIndex, opponentPlayer?.cursorIndex]);
+  }, [myPlayer, opponentPlayer, localFinished, sharedText.length, userInput.length, smoothOppCursor]);
 
-  // Current live accuracy calculation
-  const currentAccuracy = useMemo(() => {
-    const totalKeystrokes = userInput.length + inputErrors;
-    if (totalKeystrokes === 0) return 100;
-    return Math.max(0, Math.round((userInput.length / totalKeystrokes) * 100));
-  }, [userInput.length, inputErrors]);
+  const liveStats = useMemo(() => {
+    if (localFinishStats) return localFinishStats;
+    const origin = localStartMsRef.current || duelRoom?.startTime || duelRoom?.raceStartsAt || raceStartTime;
+    if (!origin || userInput.length === 0) {
+      return { wpm: 0, rawWpm: 0, accuracy: 100, finishTime: 0, errors: inputErrors, progress: 0 };
+    }
+    return computeRaceStats({
+      correctChars: userInput.length,
+      errors: inputErrors,
+      elapsedMs: Date.now() - origin,
+      totalChars: sharedText.length || 1
+    });
+  }, [userInput.length, inputErrors, raceStartTime, elapsedSeconds, duelRoom?.startTime, duelRoom?.raceStartsAt, localFinishStats, sharedText.length]);
 
-  // Live WPM calculation
-  const currentWpm = useMemo(() => {
-    const startMs = duelRoom?.startTime || duelRoom?.raceStartsAt || raceStartTime;
-    if (!startMs || userInput.length === 0) return 0;
-    const mins = Math.max(0.01, (Date.now() - startMs) / 60000);
-    return Math.round((userInput.length / 5) / mins);
-  }, [userInput.length, raceStartTime, elapsedSeconds, duelRoom?.startTime, duelRoom?.raceStartsAt]);
+  const currentAccuracy = liveStats.accuracy;
+  const currentWpm = liveStats.wpm;
+  const myLiveCursor = localFinished ? sharedText.length : userInput.length;
+  const myLiveProgress = sharedText.length
+    ? Math.min(100, Math.round((myLiveCursor / sharedText.length) * 100))
+    : (myPlayer?.progress || 0);
+  const opponentCursor = Math.max(opponentPlayer?.cursorIndex || 0, smoothOppCursor);
+  const iHaveFinished = localFinished || Boolean(myPlayer?.finished);
+  const opponentHasFinished = Boolean(opponentPlayer?.finished);
+  const waitingForOpponent = iHaveFinished && !opponentHasFinished && duelRoom?.status === 'in_progress';
+  const myDisplayWpm = iHaveFinished ? (localFinishStats?.wpm ?? myPlayer?.wpm ?? currentWpm) : currentWpm;
+  const myDisplayAccuracy = iHaveFinished ? (localFinishStats?.accuracy ?? myPlayer?.accuracy ?? currentAccuracy) : currentAccuracy;
 
   // =========================================================================
   // VIEW 1: LOBBY SCREEN (Not in a room)
@@ -902,7 +1030,10 @@ export const DuelView: React.FC<DuelViewProps> = ({
 
                   <div>
                     <span className="text-xs font-bold text-slate-300 block">{duel.textTitle}</span>
-                    <span className="text-[11px] text-slate-500 line-clamp-1">{duel.textContent}</span>
+                    <span className="text-[11px] text-slate-500 line-clamp-2">{duel.textContent}</span>
+                    <span className="text-[10px] text-emerald-400/80 font-mono">
+                      #{duel.textFingerprint || textFingerprint(duel.textContent)} · {duel.textContent.length} car.
+                    </span>
                   </div>
 
                   <button
@@ -963,14 +1094,21 @@ export const DuelView: React.FC<DuelViewProps> = ({
                 <span>{copiedCode ? 'Copié !' : 'Partager'}</span>
               </button>
             </div>
-            <span className="text-xs text-slate-400">
-              Texte : <strong className="text-slate-200">{duelRoom.textTitle}</strong> ({duelRoom.textContent.length} car.)
+            <span className="text-xs text-slate-400 flex flex-wrap items-center gap-2">
+              <span>
+                Texte : <strong className="text-slate-200">{duelRoom.textTitle}</strong> ({duelRoom.textContent.length} car.)
+              </span>
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 font-mono text-[10px] font-black">
+                <Hash size={10} />
+                SYNC {sharedFingerprint}
+              </span>
+              <span className="text-slate-500 font-mono text-[10px]">Manche {currentRound}</span>
             </span>
           </div>
         </div>
 
         <div className="flex items-center gap-3">
-          {duelRoom.status === 'in_progress' && (
+          {(duelRoom.status === 'in_progress' || waitingForOpponent) && (
             <div className="flex items-center gap-2 px-3 py-1.5 rounded-2xl bg-slate-950 border border-white/10 font-mono text-xs font-bold text-white">
               <Clock size={14} className="text-amber-400" />
               <span>{elapsedSeconds}s</span>
@@ -986,6 +1124,26 @@ export const DuelView: React.FC<DuelViewProps> = ({
           </button>
         </div>
       </div>
+
+      {duelRoom.status === 'cancelled' && (
+        <div className="bg-slate-900/70 border border-rose-500/30 rounded-[2.5rem] p-8 sm:p-12 shadow-2xl backdrop-blur-xl flex flex-col items-center text-center gap-6">
+          <div className="w-16 h-16 rounded-full bg-rose-500/20 text-rose-300 flex items-center justify-center">
+            <AlertCircle size={32} />
+          </div>
+          <div>
+            <h3 className="text-2xl font-black text-white uppercase tracking-tight">Duel annulé</h3>
+            <p className="text-sm text-slate-400 mt-2 max-w-md">
+              {duelRoom.cancelledBy?.name || "Un joueur"} a quitté le salon. Le texte et les stats de cette manche ne sont plus synchronisés.
+            </p>
+          </div>
+          <button
+            onClick={handleLeaveRoom}
+            className="px-6 py-3 rounded-2xl bg-slate-800 hover:bg-slate-700 text-white font-black text-xs uppercase tracking-wider border border-white/10"
+          >
+            Retour au lobby
+          </button>
+        </div>
+      )}
 
       {/* ------------------------------------------------------------- */}
       {/* MATCHUP VERSUS LOBBY (When waiting or ready) */}
@@ -1109,6 +1267,24 @@ export const DuelView: React.FC<DuelViewProps> = ({
                 </div>
               )}
             </div>
+          </div>
+
+          <div className="w-full max-w-3xl p-5 rounded-3xl bg-slate-950/70 border border-emerald-500/20 text-left">
+            <div className="flex flex-wrap items-center justify-between gap-2 mb-3">
+              <div className="flex items-center gap-2 text-emerald-300 text-xs font-black uppercase tracking-wider">
+                <Keyboard size={14} />
+                <span>Texte identique pour les deux pilotes</span>
+              </div>
+              <span className="font-mono text-[10px] text-emerald-400 bg-emerald-500/10 px-2 py-0.5 rounded-full border border-emerald-500/30">
+                #{sharedFingerprint} · {duelRoom.textContent.length} car.
+              </span>
+            </div>
+            <p className="text-sm sm:text-base font-mono leading-relaxed text-slate-200">
+              {duelRoom.textContent}
+            </p>
+            <p className="text-[11px] text-slate-500 mt-3">
+              Les deux joueurs tapent exactement cette phrase. Aucun texte n'est régénéré une fois le salon créé.
+            </p>
           </div>
 
           {/* Player Action Buttons */}
@@ -1271,9 +1447,9 @@ export const DuelView: React.FC<DuelViewProps> = ({
                     <span className="text-white font-black">{myPlayer?.name} (Vous)</span>
                   </div>
                   <div className="flex items-center gap-3 font-mono text-xs">
-                    <span className="text-amber-400">{myPlayer?.wpm || currentWpm} WPM</span>
-                    <span className="text-emerald-400">{myPlayer?.accuracy || currentAccuracy}%</span>
-                    <span className="text-white font-bold">{myPlayer?.progress || 0}%</span>
+                    <span className="text-amber-400">{myDisplayWpm} WPM</span>
+                    <span className="text-emerald-400">{myDisplayAccuracy}%</span>
+                    <span className="text-white font-bold">{myLiveProgress}%</span>
                   </div>
                 </div>
 
@@ -1281,7 +1457,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
                 <div className="h-4 bg-slate-900 rounded-full overflow-hidden p-0.5 border border-white/5 relative">
                   <motion.div
                     className="h-full bg-gradient-to-r from-amber-500 via-orange-400 to-yellow-400 rounded-full shadow-[0_0_12px_rgba(245,158,11,0.5)]"
-                    style={{ width: `${Math.min(100, Math.max(2, myPlayer?.progress || 0))}%` }}
+                    style={{ width: `${Math.min(100, Math.max(2, myLiveProgress))}%` }}
                     transition={{ type: "spring", stiffness: 120, damping: 20 }}
                   />
                 </div>
@@ -1300,7 +1476,9 @@ export const DuelView: React.FC<DuelViewProps> = ({
                   <div className="flex items-center gap-3 font-mono text-xs">
                     <span className="text-purple-400">{opponentPlayer?.wpm || 0} WPM</span>
                     <span className="text-emerald-400">{opponentPlayer?.accuracy || 100}%</span>
-                    <span className="text-white font-bold">{opponentPlayer?.progress || 0}%</span>
+                    <span className="text-white font-bold">
+                      {sharedText.length ? Math.min(100, Math.round((opponentCursor / sharedText.length) * 100)) : (opponentPlayer?.progress || 0)}%
+                    </span>
                   </div>
                 </div>
 
@@ -1308,7 +1486,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
                 <div className="h-4 bg-slate-900 rounded-full overflow-hidden p-0.5 border border-white/5 relative">
                   <motion.div
                     className="h-full bg-gradient-to-r from-purple-600 via-fuchsia-500 to-pink-500 rounded-full shadow-[0_0_12px_rgba(168,85,247,0.5)]"
-                    style={{ width: `${Math.min(100, Math.max(2, opponentPlayer?.progress || 0))}%` }}
+                    style={{ width: `${Math.min(100, Math.max(2, sharedText.length ? (opponentCursor / sharedText.length) * 100 : (opponentPlayer?.progress || 0)))}%` }}
                     transition={{ type: "spring", stiffness: 120, damping: 20 }}
                   />
                 </div>
@@ -1330,7 +1508,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
                   </div>
                   <div className="flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 text-xs font-bold">
                     <span className="w-2 h-2 rounded-full bg-emerald-400 animate-ping" />
-                    <span>Sync Direct 70ms</span>
+                    <span>Texte unique #{sharedFingerprint}</span>
                   </div>
                 </div>
 
@@ -1366,6 +1544,52 @@ export const DuelView: React.FC<DuelViewProps> = ({
                   </button>
                 </div>
               </div>
+
+              {opponentHasFinished && duelRoom.status === 'in_progress' && !iHaveFinished && (
+                <div className="flex flex-wrap items-center justify-between gap-3 p-4 rounded-2xl bg-purple-500/15 border border-purple-400/40 text-xs font-bold">
+                  <div className="flex items-center gap-2 text-purple-200">
+                    <Flag size={14} />
+                    <span>{opponentPlayer?.name} a terminé le texte identique ! Continuez, vos stats restent live.</span>
+                  </div>
+                  <div className="font-mono text-purple-300">
+                    {opponentPlayer?.wpm || 0} WPM · {opponentPlayer?.accuracy || 100}% · {opponentPlayer?.finishTime ?? '—'}s
+                  </div>
+                </div>
+              )}
+
+              {waitingForOpponent && (
+                <div className="p-5 rounded-3xl bg-amber-500/10 border border-amber-400/40 flex flex-col gap-4">
+                  <div className="flex flex-wrap items-center justify-between gap-3 text-xs font-bold">
+                    <div className="flex items-center gap-2 text-amber-200">
+                      <Hourglass size={14} className="animate-pulse" />
+                      <span>Vous avez validé le texte identique. Résultats live en attente de l'adversaire…</span>
+                    </div>
+                    <div className="font-mono text-amber-300">
+                      Vous : {myDisplayWpm} WPM · {myDisplayAccuracy}% · {localFinishStats?.finishTime ?? myPlayer?.finishTime ?? elapsedSeconds}s
+                    </div>
+                  </div>
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-3">
+                    <div className="p-3 rounded-2xl bg-slate-950/70 border border-white/5">
+                      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-black">Votre WPM</div>
+                      <div className="text-xl font-mono font-black text-amber-400">{myDisplayWpm}</div>
+                    </div>
+                    <div className="p-3 rounded-2xl bg-slate-950/70 border border-white/5">
+                      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-black">Votre précision</div>
+                      <div className="text-xl font-mono font-black text-emerald-400">{myDisplayAccuracy}%</div>
+                    </div>
+                    <div className="p-3 rounded-2xl bg-slate-950/70 border border-white/5">
+                      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-black">Rival WPM</div>
+                      <div className="text-xl font-mono font-black text-purple-400">{opponentPlayer?.wpm || 0}</div>
+                    </div>
+                    <div className="p-3 rounded-2xl bg-slate-950/70 border border-white/5">
+                      <div className="text-[10px] uppercase tracking-wider text-slate-500 font-black">Rival progression</div>
+                      <div className="text-xl font-mono font-black text-purple-300">
+                        {sharedText.length ? Math.min(100, Math.round((opponentCursor / sharedText.length) * 100)) : 0}%
+                      </div>
+                    </div>
+                  </div>
+                </div>
+              )}
 
               {/* Status banner on starting grid */}
               {duelRoom.status === 'starting' && (
@@ -1440,14 +1664,14 @@ export const DuelView: React.FC<DuelViewProps> = ({
                     <div className="flex items-center gap-2">
                       <div className="px-2.5 py-1 rounded-xl bg-amber-500/15 border border-amber-500/30 text-amber-300 flex items-center gap-1.5 font-mono text-xs font-bold">
                         <Gauge size={13} className="text-amber-400" />
-                        <span>{currentWpm} WPM</span>
+                        <span>{myDisplayWpm} WPM</span>
                       </div>
                       <div className="px-2.5 py-1 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-300 flex items-center gap-1.5 font-mono text-xs font-bold">
                         <Target size={13} className="text-emerald-400" />
-                        <span>{currentAccuracy}%</span>
+                        <span>{myDisplayAccuracy}%</span>
                       </div>
                       <div className="px-2.5 py-1 rounded-xl bg-slate-800/80 border border-white/10 text-slate-300 font-mono text-xs font-bold">
-                        <span>{myPlayer?.progress || 0}%</span>
+                        <span>{myLiveProgress}%</span>
                       </div>
                     </div>
                   </div>
@@ -1464,9 +1688,9 @@ export const DuelView: React.FC<DuelViewProps> = ({
                       >
                         {/* Word characters */}
                         {token.chars.map(({ char, index }) => {
-                          const isTyped = index < userInput.length;
-                          const isCurrent = index === userInput.length;
-                          const isOpponentCursor = opponentPlayer && index === opponentPlayer.cursorIndex;
+                          const isTyped = index < myLiveCursor;
+                          const isCurrent = !iHaveFinished && index === myLiveCursor;
+                          const isOpponentCursor = opponentPlayer && index === opponentCursor;
 
                           let charClass = "text-slate-400";
                           if (isTyped) {
@@ -1499,9 +1723,9 @@ export const DuelView: React.FC<DuelViewProps> = ({
                         {/* Trailing Space with Visual Indicator */}
                         {token.trailingSpace && (() => {
                           const spaceIndex = token.trailingSpace.index;
-                          const isSpaceTyped = spaceIndex < userInput.length;
-                          const isSpaceCurrent = spaceIndex === userInput.length;
-                          const isOpponentAtSpace = opponentPlayer && spaceIndex === opponentPlayer.cursorIndex;
+                          const isSpaceTyped = spaceIndex < myLiveCursor;
+                          const isSpaceCurrent = !iHaveFinished && spaceIndex === myLiveCursor;
+                          const isOpponentAtSpace = opponentPlayer && spaceIndex === opponentCursor;
 
                           return (
                             <span key={spaceIndex} className="relative inline-flex items-center mx-1">
@@ -1544,7 +1768,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
                       </span>
                       <span className="text-slate-500">•</span>
                       <span className="text-slate-400 font-mono">
-                        {userInput.length} / {duelRoom.textContent.length} car.
+                        {myLiveCursor} / {duelRoom.textContent.length} car.
                       </span>
                     </div>
 
@@ -1619,8 +1843,8 @@ export const DuelView: React.FC<DuelViewProps> = ({
                         >
                           {/* Word characters */}
                           {token.chars.map(({ char, index }) => {
-                            const isTypedByOpponent = index < (opponentPlayer.cursorIndex || 0);
-                            const isOpponentCurrent = index === opponentPlayer.cursorIndex;
+                            const isTypedByOpponent = index < opponentCursor;
+                            const isOpponentCurrent = !opponentHasFinished && index === opponentCursor;
 
                             let charClass = "text-slate-500";
                             if (isTypedByOpponent) {
@@ -1644,8 +1868,8 @@ export const DuelView: React.FC<DuelViewProps> = ({
                           {/* Trailing Space with Visual Indicator for Opponent */}
                           {token.trailingSpace && (() => {
                             const spaceIndex = token.trailingSpace.index;
-                            const isSpaceTypedByOpponent = spaceIndex < (opponentPlayer.cursorIndex || 0);
-                            const isOpponentOnSpace = spaceIndex === opponentPlayer.cursorIndex;
+                            const isSpaceTypedByOpponent = spaceIndex < opponentCursor;
+                            const isOpponentOnSpace = !opponentHasFinished && spaceIndex === opponentCursor;
 
                             return (
                               <span key={spaceIndex} className="relative inline-flex items-center mx-1">
@@ -1673,7 +1897,7 @@ export const DuelView: React.FC<DuelViewProps> = ({
                     <div className="flex flex-wrap items-center justify-between gap-4 mt-8 pt-5 border-t border-white/10 text-xs text-slate-400">
                       <div className="flex items-center gap-3">
                         <span className="text-slate-400 font-mono">
-                          {opponentPlayer.cursorIndex || 0} / {duelRoom.textContent.length} car. tapés
+                          {opponentCursor} / {duelRoom.textContent.length} car. tapés
                         </span>
                         <span className="text-slate-500">•</span>
                         <span className="text-slate-400 font-mono">
@@ -1702,10 +1926,14 @@ export const DuelView: React.FC<DuelViewProps> = ({
             >
               <div className="absolute -top-20 left-1/2 -translate-x-1/2 w-80 h-80 bg-amber-500/15 rounded-full blur-3xl pointer-events-none" />
 
-              {/* Victory Crown & Header */}
               <div>
-                <div className="w-20 h-20 rounded-full bg-gradient-to-tr from-amber-400 to-yellow-500 flex items-center justify-center text-slate-950 shadow-xl shadow-amber-500/30 mx-auto mb-4 animate-bounce">
-                  <Crown size={40} />
+                <div className={cn(
+                  "w-20 h-20 rounded-full flex items-center justify-center shadow-xl mx-auto mb-4",
+                  duelRoom.winnerId === currentPlayer.id
+                    ? "bg-gradient-to-tr from-amber-400 to-yellow-500 text-slate-950 shadow-amber-500/30 animate-bounce"
+                    : "bg-slate-800 text-slate-200"
+                )}>
+                  {duelRoom.winnerId === currentPlayer.id ? <Crown size={40} /> : <Medal size={36} />}
                 </div>
 
                 <h3 className="text-3xl sm:text-5xl font-black text-white uppercase tracking-tight">
@@ -1713,89 +1941,110 @@ export const DuelView: React.FC<DuelViewProps> = ({
                     <span className="text-transparent bg-clip-text bg-gradient-to-r from-amber-400 via-yellow-300 to-orange-400">
                       Victoire Éclatante !
                     </span>
+                  ) : opponentPlayer && duelRoom.winnerId === opponentPlayer.id ? (
+                    <span className="text-slate-200">Défaite de justesse</span>
                   ) : (
-                    <span className="text-slate-300">
-                      Course Terminée !
-                    </span>
+                    <span className="text-slate-300">Course Terminée</span>
                   )}
                 </h3>
 
-                <p className="text-sm sm:text-base text-slate-400 mt-2 max-w-md mx-auto">
+                <p className="text-sm sm:text-base text-slate-400 mt-2 max-w-lg mx-auto">
+                  Stats réelles, texte identique #{sharedFingerprint}.
                   {duelRoom.winnerId === currentPlayer.id
-                    ? "Félicitations ! Votre vitesse et votre précision ont fait la différence sur la ligne d'arrivée."
-                    : `${opponentPlayer?.name || 'Votre adversaire'} a franchi la ligne d'arrivée en premier. Prenez votre revanche !`}
+                    ? " Vous avez validé le texte en premier (ou avec le meilleur chrono)."
+                    : opponentHasFinished
+                    ? ` ${opponentPlayer?.name} a validé le même texte plus vite.`
+                    : ` ${opponentPlayer?.name || "L'adversaire"} n'a pas terminé dans le temps imparti.`}
                 </p>
               </div>
 
-              {/* Side-by-side Comparative Table */}
               <div className="w-full max-w-2xl bg-slate-950/80 border border-white/10 rounded-3xl p-6 shadow-xl">
                 <div className="grid grid-cols-3 gap-2 pb-4 border-b border-white/10 text-xs font-black uppercase tracking-wider text-slate-400">
                   <span className="text-left text-amber-400">{myPlayer?.name} (Vous)</span>
-                  <span className="text-center">Indicateur</span>
+                  <span className="text-center">Manche {currentRound}</span>
                   <span className="text-right text-purple-400">{opponentPlayer?.name || 'Adversaire'}</span>
                 </div>
 
                 <div className="flex flex-col divide-y divide-white/5 text-sm py-2">
-                  {/* WPM Row */}
-                  <div className="grid grid-cols-3 py-3 items-center">
-                    <span className={cn(
-                      "text-left font-mono font-black text-lg",
-                      (myPlayer?.wpm || 0) >= (opponentPlayer?.wpm || 0) ? "text-amber-400" : "text-white"
-                    )}>
-                      {myPlayer?.wpm || 0} WPM
-                    </span>
-                    <span className="text-center text-xs text-slate-400 font-bold uppercase">Vitesse Moyenne</span>
-                    <span className={cn(
-                      "text-right font-mono font-black text-lg",
-                      (opponentPlayer?.wpm || 0) >= (myPlayer?.wpm || 0) ? "text-purple-400" : "text-white"
-                    )}>
-                      {opponentPlayer?.wpm || 0} WPM
-                    </span>
-                  </div>
-
-                  {/* Accuracy Row */}
-                  <div className="grid grid-cols-3 py-3 items-center">
-                    <span className="text-left font-mono font-bold text-emerald-400">
-                      {myPlayer?.accuracy || 100}%
-                    </span>
-                    <span className="text-center text-xs text-slate-400 font-bold uppercase">Précision</span>
-                    <span className="text-right font-mono font-bold text-emerald-400">
-                      {opponentPlayer?.accuracy || 100}%
-                    </span>
-                  </div>
-
-                  {/* Finish Time Row */}
-                  <div className="grid grid-cols-3 py-3 items-center">
-                    <span className="text-left font-mono font-bold text-slate-300">
-                      {myPlayer?.finishTime ? `${myPlayer.finishTime}s` : 'En cours'}
-                    </span>
-                    <span className="text-center text-xs text-slate-400 font-bold uppercase">Temps de course</span>
-                    <span className="text-right font-mono font-bold text-slate-300">
-                      {opponentPlayer?.finishTime ? `${opponentPlayer.finishTime}s` : 'En cours'}
-                    </span>
-                  </div>
-
-                  {/* Errors Row */}
-                  <div className="grid grid-cols-3 py-3 items-center">
-                    <span className="text-left font-mono font-bold text-rose-400">
-                      {myPlayer?.errors || 0}
-                    </span>
-                    <span className="text-center text-xs text-slate-400 font-bold uppercase">Erreurs</span>
-                    <span className="text-right font-mono font-bold text-rose-400">
-                      {opponentPlayer?.errors || 0}
-                    </span>
-                  </div>
+                  {[
+                    {
+                      label: 'Vitesse nette',
+                      mine: `${localFinishStats?.wpm ?? myPlayer?.wpm ?? 0} WPM`,
+                      theirs: opponentHasFinished ? `${opponentPlayer?.wpm || 0} WPM` : `${opponentPlayer?.wpm || 0} WPM`,
+                      mineWin: (localFinishStats?.wpm ?? myPlayer?.wpm ?? 0) >= (opponentPlayer?.wpm || 0)
+                    },
+                    {
+                      label: 'Vitesse brute',
+                      mine: `${localFinishStats?.rawWpm ?? myPlayer?.rawWpm ?? myPlayer?.wpm ?? 0} WPM`,
+                      theirs: `${opponentPlayer?.rawWpm ?? opponentPlayer?.wpm ?? 0} WPM`,
+                      mineWin: (localFinishStats?.rawWpm ?? myPlayer?.rawWpm ?? 0) >= (opponentPlayer?.rawWpm ?? opponentPlayer?.wpm ?? 0)
+                    },
+                    {
+                      label: 'Précision',
+                      mine: `${localFinishStats?.accuracy ?? myPlayer?.accuracy ?? 100}%`,
+                      theirs: `${opponentPlayer?.accuracy ?? 100}%`,
+                      mineWin: (localFinishStats?.accuracy ?? myPlayer?.accuracy ?? 100) >= (opponentPlayer?.accuracy ?? 100)
+                    },
+                    {
+                      label: 'Temps réel',
+                      mine: myPlayer?.finishTime || localFinishStats?.finishTime
+                        ? `${localFinishStats?.finishTime ?? myPlayer?.finishTime}s`
+                        : `${elapsedSeconds}s`,
+                      theirs: opponentPlayer?.finishTime
+                        ? `${opponentPlayer.finishTime}s`
+                        : opponentHasFinished ? '—' : 'Abandon / DNF',
+                      mineWin: (localFinishStats?.finishTime ?? myPlayer?.finishTime ?? 999) <= (opponentPlayer?.finishTime ?? 999)
+                    },
+                    {
+                      label: 'Erreurs',
+                      mine: `${localFinishStats?.errors ?? myPlayer?.errors ?? 0}`,
+                      theirs: `${opponentPlayer?.errors || 0}`,
+                      mineWin: (localFinishStats?.errors ?? myPlayer?.errors ?? 0) <= (opponentPlayer?.errors || 0)
+                    },
+                    {
+                      label: 'Caractères',
+                      mine: `${myPlayer?.correctChars ?? myLiveCursor} / ${sharedText.length}`,
+                      theirs: `${opponentPlayer?.correctChars ?? opponentCursor} / ${sharedText.length}`,
+                      mineWin: (myPlayer?.correctChars ?? myLiveCursor) >= (opponentPlayer?.correctChars ?? opponentCursor)
+                    }
+                  ].map((row) => (
+                    <div key={row.label} className="grid grid-cols-3 py-3 items-center">
+                      <span className={cn("text-left font-mono font-black text-base sm:text-lg", row.mineWin ? "text-amber-400" : "text-white")}>
+                        {row.mine}
+                      </span>
+                      <span className="text-center text-[11px] sm:text-xs text-slate-400 font-bold uppercase">{row.label}</span>
+                      <span className={cn("text-right font-mono font-black text-base sm:text-lg", !row.mineWin ? "text-purple-400" : "text-white")}>
+                        {row.theirs}
+                      </span>
+                    </div>
+                  ))}
                 </div>
               </div>
 
-              {/* Rematch & Next actions */}
+              <div className="w-full max-w-2xl p-4 rounded-2xl bg-emerald-500/10 border border-emerald-500/20 text-left">
+                <div className="flex items-center justify-between gap-2 mb-2">
+                  <span className="text-[11px] font-black uppercase tracking-wider text-emerald-300">Texte de la manche (identique)</span>
+                  <span className="font-mono text-[10px] text-emerald-400">#{sharedFingerprint}</span>
+                </div>
+                <p className="text-sm font-mono text-slate-200 leading-relaxed">{duelRoom.textContent}</p>
+              </div>
+
               <div className="flex flex-wrap items-center justify-center gap-4">
                 <button
                   onClick={handleRematch}
-                  className="flex items-center gap-2 px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-slate-950 font-black text-xs uppercase tracking-wider shadow-lg shadow-amber-500/20 active:scale-95 transition-all cursor-pointer"
+                  disabled={!duelRoom.isBot && Boolean(myPlayer?.rematchReady)}
+                  className="flex items-center gap-2 px-6 py-3.5 rounded-2xl bg-gradient-to-r from-amber-500 to-yellow-500 hover:from-amber-400 hover:to-yellow-400 text-slate-950 font-black text-xs uppercase tracking-wider shadow-lg shadow-amber-500/20 active:scale-95 transition-all cursor-pointer disabled:opacity-70 disabled:cursor-wait"
                 >
                   <RotateCcw size={16} />
-                  <span>Revanche Immédiate (Nouveau texte)</span>
+                  <span>
+                    {duelRoom.isBot
+                      ? 'Revanche (nouveau texte identique)'
+                      : myPlayer?.rematchReady
+                      ? "En attente de l'adversaire…"
+                      : opponentPlayer?.rematchReady
+                      ? "Accepter la revanche"
+                      : 'Revanche (même salon, nouveau texte)'}
+                  </span>
                 </button>
 
                 <button

@@ -1,16 +1,15 @@
 import { 
   collection, 
   doc, 
-  setDoc, 
   addDoc, 
   getDoc, 
   getDocs, 
   query, 
   where, 
-  orderBy, 
   limit, 
   onSnapshot, 
-  updateDoc 
+  updateDoc,
+  runTransaction
 } from 'firebase/firestore';
 import { db, OperationType, handleFirestoreError } from './firebase';
 import { KeyboardLayoutType, sanitizeForQwerty } from './constants';
@@ -20,13 +19,18 @@ export interface DuelPlayer {
   name: string;
   photo?: string | null;
   ready: boolean;
-  progress: number; // 0 - 100%
+  rematchReady?: boolean;
+  progress: number;
   cursorIndex: number;
   wpm: number;
+  rawWpm?: number;
   accuracy: number;
   errors: number;
+  correctChars?: number;
+  totalKeystrokes?: number;
   finished: boolean;
-  finishTime?: number | null; // in seconds
+  finishTime?: number | null;
+  lastHeartbeat?: number | null;
 }
 
 export type DuelCategory = 'sprint' | 'standard' | 'literary' | 'tech';
@@ -44,17 +48,23 @@ export interface DuelTextItem {
 export interface DuelRoom {
   id: string;
   code: string;
+  textId: string;
   textTitle: string;
   textContent: string;
+  textFingerprint: string;
   category: DuelCategory;
+  layout: KeyboardLayoutType;
   status: 'waiting' | 'ready' | 'starting' | 'in_progress' | 'finished' | 'cancelled';
-  countdown?: number;
-  startTime?: number; // timestamp ms
-  raceStartsAt?: number; // target epoch timestamp ms when race launches for both players simultaneously
+  countdown?: number | null;
+  startTime?: number | null;
+  raceStartsAt?: number | null;
   createdAt: string;
+  round: number;
   player1: DuelPlayer;
   player2?: DuelPlayer | null;
   winnerId?: string | null;
+  firstFinisherId?: string | null;
+  finishDeadlineAt?: number | null;
   cancelledBy?: {
     id: string;
     name: string;
@@ -63,6 +73,103 @@ export interface DuelRoom {
   isBot?: boolean;
   botDifficulty?: 'easy' | 'medium' | 'hard' | 'expert';
   botTargetWpm?: number;
+}
+
+export const RACE_SYNC_MS = 180;
+export const FINISH_GRACE_MS = 90000;
+
+export function textFingerprint(text: string): string {
+  let hash = 0;
+  for (let i = 0; i < text.length; i++) {
+    hash = ((hash << 5) - hash + text.charCodeAt(i)) | 0;
+  }
+  return Math.abs(hash).toString(36).toUpperCase().padStart(6, '0').slice(0, 6);
+}
+
+export function getStableGuestId(): string {
+  const storageKey = 'typeflow_guest_id';
+  try {
+    const existing = localStorage.getItem(storageKey);
+    if (existing) return existing;
+    const created = `guest_${Math.random().toString(36).slice(2, 10)}`;
+    localStorage.setItem(storageKey, created);
+    return created;
+  } catch {
+    return `guest_${Math.random().toString(36).slice(2, 10)}`;
+  }
+}
+
+export function computeRaceStats(params: {
+  correctChars: number;
+  errors: number;
+  elapsedMs: number;
+  totalChars: number;
+}): {
+  wpm: number;
+  rawWpm: number;
+  accuracy: number;
+  progress: number;
+  finishTime: number;
+  totalKeystrokes: number;
+} {
+  const elapsedMs = Math.max(250, params.elapsedMs);
+  const minutes = elapsedMs / 60000;
+  const totalKeystrokes = params.correctChars + params.errors;
+  const wpm = minutes > 0 ? Math.round((params.correctChars / 5) / minutes) : 0;
+  const rawWpm = minutes > 0 ? Math.round((totalKeystrokes / 5) / minutes) : 0;
+  const accuracy =
+    totalKeystrokes === 0
+      ? 100
+      : Math.max(0, Math.min(100, Math.round((params.correctChars / totalKeystrokes) * 100)));
+  const progress =
+    params.totalChars === 0
+      ? 0
+      : Math.min(100, Math.round((params.correctChars / params.totalChars) * 100));
+  const finishTime = Math.round((elapsedMs / 1000) * 100) / 100;
+  return { wpm, rawWpm, accuracy, progress, finishTime, totalKeystrokes };
+}
+
+function createFreshPlayer(base: { id: string; name: string; photo?: string | null }, ready = false): DuelPlayer {
+  return {
+    id: base.id,
+    name: base.name || 'Pilote Anonyme',
+    photo: base.photo || null,
+    ready,
+    rematchReady: false,
+    progress: 0,
+    cursorIndex: 0,
+    wpm: 0,
+    rawWpm: 0,
+    accuracy: 100,
+    errors: 0,
+    correctChars: 0,
+    totalKeystrokes: 0,
+    finished: false,
+    finishTime: null,
+    lastHeartbeat: null
+  };
+}
+
+function resolveWinner(playerA: DuelPlayer, playerB: DuelPlayer): string {
+  const aDone = Boolean(playerA.finished);
+  const bDone = Boolean(playerB.finished);
+  if (aDone && !bDone) return playerA.id;
+  if (bDone && !aDone) return playerB.id;
+
+  const aTime = playerA.finishTime ?? Number.POSITIVE_INFINITY;
+  const bTime = playerB.finishTime ?? Number.POSITIVE_INFINITY;
+  if (aTime + 0.02 < bTime) return playerA.id;
+  if (bTime + 0.02 < aTime) return playerB.id;
+
+  const aWpm = playerA.wpm ?? 0;
+  const bWpm = playerB.wpm ?? 0;
+  if (aWpm !== bWpm) return aWpm > bWpm ? playerA.id : playerB.id;
+
+  const aAcc = playerA.accuracy ?? 0;
+  const bAcc = playerB.accuracy ?? 0;
+  if (aAcc !== bAcc) return aAcc > bAcc ? playerA.id : playerB.id;
+
+  return playerA.id;
 }
 
 export const DUEL_TEXTS: DuelTextItem[] = [
@@ -174,13 +281,17 @@ export const DUEL_TEXTS: DuelTextItem[] = [
   }
 ];
 
-export function getDuelText(category?: DuelCategory, layout: KeyboardLayoutType = 'azerty'): DuelTextItem {
-  let filtered = DUEL_TEXTS;
-  if (category) {
-    filtered = DUEL_TEXTS.filter(t => t.category === category);
+export function getDuelText(
+  category?: DuelCategory,
+  layout: KeyboardLayoutType = 'azerty',
+  excludeId?: string
+): DuelTextItem {
+  let filtered = category ? DUEL_TEXTS.filter(t => t.category === category) : [...DUEL_TEXTS];
+  if (excludeId && filtered.length > 1) {
+    const withoutCurrent = filtered.filter(t => t.id !== excludeId);
+    if (withoutCurrent.length > 0) filtered = withoutCurrent;
   }
   const randomItem = filtered[Math.floor(Math.random() * filtered.length)] || DUEL_TEXTS[0];
-  
   if (layout === 'qwerty') {
     return {
       ...randomItem,
@@ -190,12 +301,15 @@ export function getDuelText(category?: DuelCategory, layout: KeyboardLayoutType 
   return randomItem;
 }
 
-// Generate a memorable 6-character room code like "DUEL-42" or "RACE-87"
 export function generateRoomCode(): string {
   const prefixes = ['DUEL', 'RACE', 'FAST', 'VOLT', 'APEX', 'FLUX', 'ZOOM', 'FIRE'];
   const prefix = prefixes[Math.floor(Math.random() * prefixes.length)];
-  const num = Math.floor(10 + Math.random() * 90);
-  return `${prefix}-${num}`;
+  const alphabet = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+  let suffix = '';
+  for (let i = 0; i < 4; i++) {
+    suffix += alphabet[Math.floor(Math.random() * alphabet.length)];
+  }
+  return `${prefix}-${suffix}`;
 }
 
 // Bot competitor profiles
@@ -232,20 +346,7 @@ export async function createFirestoreDuel(params: {
   const chosenText = getDuelText(params.category, params.layout);
   const roomCode = generateRoomCode();
   const now = new Date().toISOString();
-
-  const player1: DuelPlayer = {
-    id: params.creator.id,
-    name: params.creator.name || 'Pilote Anonyme',
-    photo: params.creator.photo || null,
-    ready: false,
-    progress: 0,
-    cursorIndex: 0,
-    wpm: 0,
-    accuracy: 100,
-    errors: 0,
-    finished: false,
-    finishTime: null
-  };
+  const player1 = createFreshPlayer(params.creator);
 
   let player2: DuelPlayer | null = null;
   let botTargetWpm: number | null = null;
@@ -255,36 +356,36 @@ export async function createFirestoreDuel(params: {
     botDiff = params.botDifficulty || 'medium';
     const bot = BOT_PROFILES.find(b => b.difficulty === botDiff) || BOT_PROFILES[1];
     botTargetWpm = bot.wpm;
-    player2 = {
-      id: `bot_${bot.difficulty}`,
-      name: bot.name,
-      photo: null,
-      ready: true,
-      progress: 0,
-      cursorIndex: 0,
-      wpm: bot.wpm,
-      accuracy: bot.accuracy,
-      errors: 0,
-      finished: false,
-      finishTime: null
-    };
+    player2 = createFreshPlayer(
+      { id: `bot_${bot.difficulty}`, name: bot.name, photo: null },
+      true
+    );
+    player2.wpm = bot.wpm;
+    player2.accuracy = bot.accuracy;
   }
 
   const rawRoomData = {
     code: roomCode,
+    textId: chosenText.id,
     textTitle: chosenText.title,
     textContent: chosenText.content,
+    textFingerprint: textFingerprint(chosenText.content),
     category: chosenText.category,
+    layout: params.layout,
     status: params.isBot ? 'ready' : 'waiting',
     createdAt: now,
+    round: 1,
     player1,
     player2: player2 || null,
     winnerId: null,
+    firstFinisherId: null,
+    finishDeadlineAt: null,
     isBot: Boolean(params.isBot),
     botDifficulty: botDiff,
     botTargetWpm: botTargetWpm,
     countdown: null,
-    startTime: null
+    startTime: null,
+    raceStartsAt: null
   };
 
   const roomData = sanitizeForFirestore(rawRoomData);
@@ -351,19 +452,11 @@ export async function joinFirestoreDuelByCode(
       throw new Error("Ce salon de duel est déjà complet ou la course a déjà débuté.");
     }
 
-    const player2: DuelPlayer = {
+    const player2 = createFreshPlayer({
       id: joiningPlayer.id,
       name: joiningPlayer.name || 'Challenger',
-      photo: joiningPlayer.photo || null,
-      ready: false,
-      progress: 0,
-      cursorIndex: 0,
-      wpm: 0,
-      accuracy: 100,
-      errors: 0,
-      finished: false,
-      finishTime: null
-    };
+      photo: joiningPlayer.photo || null
+    });
 
     await updateDoc(doc(db, path, duelDoc.id), {
       player2,
@@ -467,65 +560,208 @@ export async function setPlayerReadyStatus(
   }
 }
 
-// Start duel countdown and launch with synchronized epoch target
 export async function startDuelCountdown(duelId: string): Promise<void> {
   const docRef = doc(db, 'duels', duelId);
   try {
-    const now = Date.now();
-    // 3800ms gives ample time (about 0.8s) for Firestore update to arrive on both clients
-    // before the countdown goes 3 -> 2 -> 1 -> 0 perfectly in sync
-    const raceStartsAt = now + 3800;
-    await updateDoc(docRef, {
-      status: 'starting',
-      countdown: 3,
-      raceStartsAt: raceStartsAt
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'ready') return;
+      if (!data.player1?.ready || !data.player2?.ready) return;
+      transaction.update(docRef, {
+        status: 'starting',
+        countdown: 3,
+        raceStartsAt: Date.now() + 3800,
+        startTime: null,
+        winnerId: null,
+        firstFinisherId: null,
+        finishDeadlineAt: null
+      });
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
   }
 }
 
-// Transition duel to in_progress (atomic check)
 export async function launchDuelRace(duelId: string, actualStartTime?: number): Promise<void> {
   const docRef = doc(db, 'duels', duelId);
   try {
-    const snap = await getDoc(docRef);
-    if (snap.exists() && (snap.data()?.status === 'starting' || snap.data()?.status === 'ready')) {
-      await updateDoc(docRef, {
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'starting' && data.status !== 'ready') return;
+      transaction.update(docRef, {
         status: 'in_progress',
-        startTime: actualStartTime || Date.now()
+        startTime: actualStartTime || data.raceStartsAt || Date.now()
       });
-    }
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
   }
 }
 
-// Finish duel and crown winner
-export async function finishDuelRoom(
+function applyPlayerStats(
+  prefix: 'player1' | 'player2',
+  stats: Partial<DuelPlayer>
+): Record<string, unknown> {
+  const updateObj: Record<string, unknown> = {};
+  for (const [key, val] of Object.entries(stats)) {
+    if (val !== undefined) {
+      updateObj[`${prefix}.${key}`] = val;
+    }
+  }
+  return updateObj;
+}
+
+export async function reportPlayerFinished(
   duelId: string,
-  winnerId: string,
   playerRole: 'player1' | 'player2',
   finalPlayerStats: Partial<DuelPlayer>
 ): Promise<void> {
   const docRef = doc(db, 'duels', duelId);
   try {
-    const updateObj: Record<string, any> = {
-      status: 'finished',
-      winnerId
-    };
-    for (const [key, val] of Object.entries(finalPlayerStats)) {
-      if (val !== undefined) {
-        updateObj[`${playerRole}.${key}`] = val;
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status === 'cancelled') return;
+
+      const me = playerRole === 'player1' ? data.player1 : data.player2;
+      const opponent = playerRole === 'player1' ? data.player2 : data.player1;
+      if (!me) return;
+      if (me.finished && data.status === 'finished') return;
+
+      const mergedMe: DuelPlayer = {
+        ...me,
+        ...finalPlayerStats,
+        finished: true,
+        progress: 100
+      };
+
+      const updates: Record<string, unknown> = {
+        ...applyPlayerStats(playerRole, {
+          ...finalPlayerStats,
+          finished: true,
+          progress: 100,
+          cursorIndex: finalPlayerStats.cursorIndex ?? data.textContent.length
+        })
+      };
+
+      if (!opponent) {
+        updates.status = 'finished';
+        updates.winnerId = me.id;
+        updates.firstFinisherId = data.firstFinisherId || me.id;
+        transaction.update(docRef, updates);
+        return;
       }
-    }
-    await updateDoc(docRef, updateObj);
+
+      if (opponent.finished) {
+        const mergedOpponent: DuelPlayer = { ...opponent, finished: true };
+        updates.status = 'finished';
+        updates.winnerId = resolveWinner(mergedMe, mergedOpponent);
+        updates.firstFinisherId = data.firstFinisherId || me.id;
+        updates.finishDeadlineAt = null;
+      } else {
+        updates.firstFinisherId = data.firstFinisherId || me.id;
+        updates.winnerId = data.winnerId || me.id;
+        updates.finishDeadlineAt = data.finishDeadlineAt || Date.now() + FINISH_GRACE_MS;
+      }
+
+      transaction.update(docRef, updates);
+    });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
   }
 }
 
-// Rematch / Replay: reset duel with a new random text
+export async function finishDuelRoom(
+  duelId: string,
+  _winnerId: string,
+  playerRole: 'player1' | 'player2',
+  finalPlayerStats: Partial<DuelPlayer>
+): Promise<void> {
+  await reportPlayerFinished(duelId, playerRole, finalPlayerStats);
+}
+
+export async function finalizeDuelIfDeadlinePassed(duelId: string): Promise<void> {
+  const docRef = doc(db, 'duels', duelId);
+  try {
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'in_progress') return;
+      if (!data.finishDeadlineAt || Date.now() < data.finishDeadlineAt) return;
+
+      const p1 = data.player1;
+      const p2 = data.player2;
+      if (!p1 || !p2) return;
+      if (!p1.finished && !p2.finished) return;
+
+      transaction.update(docRef, {
+        status: 'finished',
+        winnerId: resolveWinner(
+          { ...p1, finished: Boolean(p1.finished) },
+          { ...p2, finished: Boolean(p2.finished) }
+        ),
+        finishDeadlineAt: null
+      });
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
+  }
+}
+
+function rematchResetPayload(
+  newText: DuelTextItem,
+  layout: KeyboardLayoutType,
+  isBotMatch: boolean,
+  currentRound: number
+): Record<string, unknown> {
+  return {
+    status: 'ready',
+    textId: newText.id,
+    textTitle: newText.title,
+    textContent: newText.content,
+    textFingerprint: textFingerprint(newText.content),
+    category: newText.category,
+    layout,
+    round: currentRound + 1,
+    winnerId: null,
+    firstFinisherId: null,
+    finishDeadlineAt: null,
+    countdown: null,
+    startTime: null,
+    raceStartsAt: null,
+    'player1.ready': false,
+    'player1.rematchReady': false,
+    'player1.progress': 0,
+    'player1.cursorIndex': 0,
+    'player1.wpm': 0,
+    'player1.rawWpm': 0,
+    'player1.accuracy': 100,
+    'player1.errors': 0,
+    'player1.correctChars': 0,
+    'player1.totalKeystrokes': 0,
+    'player1.finished': false,
+    'player1.finishTime': null,
+    'player2.ready': isBotMatch,
+    'player2.rematchReady': false,
+    'player2.progress': 0,
+    'player2.cursorIndex': 0,
+    'player2.wpm': 0,
+    'player2.rawWpm': 0,
+    'player2.accuracy': 100,
+    'player2.errors': 0,
+    'player2.correctChars': 0,
+    'player2.totalKeystrokes': 0,
+    'player2.finished': false,
+    'player2.finishTime': null
+  };
+}
+
 export async function rematchDuelRoom(
   duelId: string,
   category: DuelCategory,
@@ -533,32 +769,86 @@ export async function rematchDuelRoom(
   isBotMatch: boolean = false
 ): Promise<void> {
   const docRef = doc(db, 'duels', duelId);
-  const newText = getDuelText(category, layout);
   try {
-    await updateDoc(docRef, {
-      status: 'ready',
-      textTitle: newText.title,
-      textContent: newText.content,
-      category: newText.category,
-      winnerId: null,
-      countdown: null,
-      startTime: null,
-      'player1.ready': false,
-      'player1.progress': 0,
-      'player1.cursorIndex': 0,
-      'player1.wpm': 0,
-      'player1.accuracy': 100,
-      'player1.errors': 0,
-      'player1.finished': false,
-      'player1.finishTime': null,
-      'player2.ready': isBotMatch,
-      'player2.progress': 0,
-      'player2.cursorIndex': 0,
-      'player2.wpm': 0,
-      'player2.accuracy': 100,
-      'player2.errors': 0,
-      'player2.finished': false,
-      'player2.finishTime': null
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'finished' && data.status !== 'cancelled') return;
+      const lockedLayout = data.layout || layout;
+      const lockedCategory = data.category || category;
+      const newText = getDuelText(lockedCategory, lockedLayout, data.textId);
+      transaction.update(docRef, rematchResetPayload(newText, lockedLayout, isBotMatch, data.round || 1));
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
+  }
+}
+
+export async function requestRematch(
+  duelId: string,
+  playerRole: 'player1' | 'player2',
+  category: DuelCategory,
+  layout: KeyboardLayoutType,
+  isBotMatch: boolean = false
+): Promise<void> {
+  if (isBotMatch) {
+    await rematchDuelRoom(duelId, category, layout, true);
+    return;
+  }
+
+  const docRef = doc(db, 'duels', duelId);
+  try {
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'finished') return;
+
+      const already = playerRole === 'player1' ? data.player1?.rematchReady : data.player2?.rematchReady;
+      const opponentReady = playerRole === 'player1' ? data.player2?.rematchReady : data.player1?.rematchReady;
+
+      const lockedLayout = data.layout || layout;
+      const lockedCategory = data.category || category;
+
+      if (already && opponentReady) {
+        const newText = getDuelText(lockedCategory, lockedLayout, data.textId);
+        transaction.update(docRef, rematchResetPayload(newText, lockedLayout, false, data.round || 1));
+        return;
+      }
+
+      if (opponentReady) {
+        const newText = getDuelText(lockedCategory, lockedLayout, data.textId);
+        transaction.update(docRef, rematchResetPayload(newText, lockedLayout, false, data.round || 1));
+        return;
+      }
+
+      transaction.update(docRef, {
+        [`${playerRole}.rematchReady`]: true
+      });
+    });
+  } catch (error) {
+    handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
+  }
+}
+
+export async function tryStartRematch(
+  duelId: string,
+  category: DuelCategory,
+  layout: KeyboardLayoutType
+): Promise<void> {
+  const docRef = doc(db, 'duels', duelId);
+  try {
+    await runTransaction(db, async (transaction) => {
+      const snap = await transaction.get(docRef);
+      if (!snap.exists()) return;
+      const data = snap.data() as DuelRoom;
+      if (data.status !== 'finished') return;
+      if (!data.player1?.rematchReady || !data.player2?.rematchReady) return;
+      const lockedLayout = data.layout || layout;
+      const lockedCategory = data.category || category;
+      const newText = getDuelText(lockedCategory, lockedLayout, data.textId);
+      transaction.update(docRef, rematchResetPayload(newText, lockedLayout, Boolean(data.isBot), data.round || 1));
     });
   } catch (error) {
     handleFirestoreError(error, OperationType.UPDATE, `duels/${duelId}`);
